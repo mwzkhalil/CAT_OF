@@ -61,3 +61,16 @@ class TrainConfig:
     test_dataset_path: str = "Lin-Chen/MMStar"
     wandb_entity: str = "mwz" # Indicate the entity to log to in wandb
     log_wandb: bool = True
+
+
+    num_workers: int = 4                    # Number of data loading workers
+    log_every: int = 100                    # Log every N steps
+    val_every: int = 1                      # Validate every N epochs
+    test_every: int = 1                     # Test every N epochs
+    save_every: int = 1                     # Save checkpoint every N epochs
+    grad_clip_norm: float = 1.0             # Gradient clipping norm
+    auto_resume: bool = True                # Auto resume from latest checkpoint
+    optimizer_type: str = 'AdamW'           # Optimizer type
+    activation_function: str = 'relu'       # Activation function
+    weight_decay_mp: float = 0.01           # Weight decay for MP parameters
+    weight_decay_backbone: float = 0
