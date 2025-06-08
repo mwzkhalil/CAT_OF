@@ -1,449 +1,3 @@
-# import math
-# import time
-# import torch
-# import wandb
-# import numpy
-# import random
-# import argparse
-# import contextlib
-# import torch.optim as optim
-# from statistics import mean
-# from dataclasses import asdict
-# from datasets import load_dataset, concatenate_datasets
-# from torch.utils.data import DataLoader, RandomSampler, DistributedSampler
-# import torch.distributed as dist
-# from torch.nn.parallel import DistributedDataParallel
-
-# torch.manual_seed(0)
-# if torch.cuda.is_available():
-#     torch.cuda.manual_seed_all(0)
-
-# from data.collators import VQACollator, MMStarCollator
-# from data.datasets import MMStarDataset, VQADataset
-# from data.processors import get_image_processor, get_tokenizer
-# from models.vision_language_model import CAT
-# import models.config as config
-# import models.utils as utils
-
-# #Otherwise, the tokenizer will through a warning
-# import os
-# os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-# def init_dist():
-#     dist.init_process_group(backend='nccl')
-#     torch.cuda.set_device(dist.get_rank())
-
-# def destroy_dist():
-#     dist.destroy_process_group()
-
-# def is_dist():
-#     return dist.is_available() and dist.is_initialized()
-
-# def is_master():
-#     return dist.get_rank() == 0 if is_dist() else True
-
-# def get_world_size():
-#     return dist.get_world_size() if is_dist() else 1
-
-# def get_rank():
-#     return dist.get_rank() if is_dist() else 0
-
-# def dist_gather(o):
-#     o_all = [None for _ in range(dist.get_world_size())]
-#     dist.all_gather_object(o_all, o)
-#     return o_all
-
-# def wrap_model(model):
-#     return DistributedDataParallel(model, device_ids=[dist.get_rank()])
-
-# def get_run_name(train_cfg):
-#     dataset_size = "full_ds" if train_cfg.data_cutoff_idx is None else f"{train_cfg.data_cutoff_idx}samples"
-#     batch_size = f"bs{int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}"
-#     epochs = f"ep{train_cfg.epochs}"
-#     learning_rate = f"lr{train_cfg.lr_backbones}-{train_cfg.lr_mp}"
-#     num_gpus = f"{get_world_size()}xGPU"
-#     date = time.strftime("%m%d")
-
-#     return f"CAT_{num_gpus}_{dataset_size}_{batch_size}_{epochs}_{learning_rate}_{date}"
-
-# def get_generator():
-#     g = torch.Generator()
-#     g.manual_seed(0)  # Fixed global seed
-#     return g
-
-# def get_dataloaders(train_cfg, vlm_cfg):
-#     # Create datasets
-#     image_processor = get_image_processor(vlm_cfg.vit_img_size)
-#     tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer)
-
-#     # Load and combine all training datasets
-#     combined_train_data = []
-#     for dataset_name in train_cfg.train_dataset_name:
-#         train_ds = load_dataset(train_cfg.train_dataset_path, dataset_name)
-#         combined_train_data.append(train_ds['train'])
-#     train_ds = concatenate_datasets(combined_train_data)
-    
-#     test_ds = load_dataset(train_cfg.test_dataset_path)
-#     train_ds = train_ds.shuffle(seed=0) # Shuffle the training dataset, so train and val get equal contributions from all concatinated datasets
-
-#     # Apply cutoff if specified
-#     if train_cfg.data_cutoff_idx is None:
-#         total_samples = len(train_ds)  # Use the entire dataset
-#     else:
-#         total_samples = min(len(train_ds), train_cfg.data_cutoff_idx)
-
-#     val_size = int(total_samples * train_cfg.val_ratio)
-#     train_size = total_samples - val_size
-
-#     train_dataset = VQADataset(train_ds.select(range(train_size)), tokenizer, image_processor)
-#     val_dataset = VQADataset(train_ds.select(range(train_size, total_samples)), tokenizer, image_processor)
-#     test_dataset = MMStarDataset(test_ds['val'], tokenizer, image_processor)
-
-#     # Create collators
-#     vqa_collator = VQACollator(tokenizer, vlm_cfg.lm_max_length)
-#     mmstar_collator = MMStarCollator(tokenizer)
-
-#     def seed_worker(worker_id):
-#         worker_seed = torch.initial_seed() % 2**32
-#         numpy.random.seed(worker_seed)
-#         random.seed(worker_seed)
-
-#     # g = torch.Generator()
-#     # g.manual_seed(0)
-#     g = get_generator()
-
-#     # Create dataloaders
-#     train_sampler = DistributedSampler(
-#         train_dataset, 
-#         rank=get_rank(),
-#         num_replicas=get_world_size(),
-#     )
-
-#     train_loader = DataLoader(
-#         train_dataset,
-#         batch_size=train_cfg.batch_size,    # =per device BS in DDP
-#         sampler=train_sampler,
-#         collate_fn=vqa_collator,
-#         num_workers=0,
-#         pin_memory=True,
-#         drop_last=True,
-#         worker_init_fn=seed_worker,
-#         generator=g,
-#     )
-
-#     val_sampler = DistributedSampler(
-#         val_dataset,
-#         rank=get_rank(),
-#         num_replicas=get_world_size(),
-#         shuffle=False  # Usually False for validation
-#     )
-
-#     val_loader = DataLoader(
-#         val_dataset,
-#         batch_size=train_cfg.batch_size,
-#         sampler=val_sampler,
-#         collate_fn=vqa_collator,
-#         num_workers=0,
-#         pin_memory=True,
-#         drop_last=True,
-#         worker_init_fn=seed_worker,
-#         generator=g,
-#     )
-
-#     test_loader = DataLoader(
-#         test_dataset, 
-#         batch_size=train_cfg.mmstar_batch_size, 
-#         shuffle=False, 
-#         collate_fn=mmstar_collator,
-#         pin_memory=True,
-#         worker_init_fn=seed_worker,
-#         generator=g,
-#         )
-
-#     return train_loader, val_loader, test_loader
-
-# def test_mmstar(model, tokenizer, test_loader, device):
-#     total_examples = 0
-#     correct_predictions = 0
-#     with torch.no_grad():
-#         for batch in test_loader:
-#             image = batch['images'].to(device)
-#             input_ids = batch['input_ids'].to(device)
-#             labels = batch['labels'].to(device)
-#             attention_mask = batch['attention_mask'].to(device)
-            
-#             correct_answer = tokenizer.batch_decode(labels, skip_special_tokens=True)
-            
-#             gen = model.generate(input_ids, image, attention_mask)
-#             model_output = tokenizer.batch_decode(gen, skip_special_tokens=True)
-            
-#             is_correct = utils.check_multiple_choice_with_regex(model_output, correct_answer)
-            
-#             total_examples += len(is_correct)
-#             if is_correct:
-#                 correct_predictions += sum(is_correct)
-#     accuracy = correct_predictions / total_examples if total_examples > 0 else 0
-#     return accuracy
-
-# # Cosine learning rate schedule with warmup (from Karpathy)
-# def get_lr(it, max_lr, max_steps):
-#     min_lr = max_lr * 0.1
-#     warmup_steps = max_steps * 0.03
-#     # 1) linear warmup for warmup_iters steps
-#     if it < warmup_steps:
-#         return max_lr * (it+1) / warmup_steps
-#     # 2) if it > lr_decay_iters, return min learning rate
-#     if it > max_steps:
-#         return min_lr
-#     # 3) in between, use cosine decay down to min learning rate
-#     decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-#     assert 0 <= decay_ratio <= 1
-#     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
-#     return min_lr + coeff * (max_lr - min_lr)
-
-# def train(train_cfg, vlm_cfg):
-#     train_loader, val_loader, test_loader = get_dataloaders(train_cfg, vlm_cfg)
-#     tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer)
-
-#     total_dataset_size = len(train_loader.dataset)
-#     if train_cfg.log_wandb and is_master():
-#         run_name = get_run_name(train_cfg)
-#         if train_cfg.data_cutoff_idx is None:
-#             run_name = run_name.replace("full_ds", f"{total_dataset_size}samples")
-#         run = wandb.init(
-#             entity=train_cfg.wandb_entity,
-#             project="CAT",
-#             config={
-#                 "VLMConfig": asdict(vlm_cfg),
-#                 "TrainConfig": asdict(train_cfg)
-#             },
-#             name=run_name,
-#         )
-
-#     # Initialize model
-#     if train_cfg.resume_from_vlm_checkpoint:
-#         model = CAT.from_pretrained(vlm_cfg.vlm_checkpoint_path)
-#     else:
-#         model = CAT(vlm_cfg, load_backbone=vlm_cfg.vlm_load_backbone_weights)
-    
-#     if is_master():
-#         print(f"CAT initialized with {sum(p.numel() for p in model.parameters()):,} parameters") 
-#         print(f"Training summary{' (global)' if is_dist() else ''}: {len(train_loader.dataset)} samples, {int(len(train_loader)*get_world_size())} batches/epoch, batch size {int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}{', training on ' + str(get_world_size()) + ' GPUs' if is_dist() else ''}")
-#         if is_dist():
-#             print(f"Training summary per GPU: {len(train_loader)} batches/epoch, batch size {train_loader.batch_size}")
-#         print(f"Validation summary{' (global)' if is_dist() else ''}: {len(val_loader.dataset)} samples, {int(len(val_loader)*get_world_size())} batches/epoch, batch size {int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}{', training on ' + str(get_world_size()) + ' GPUs' if is_dist() else ''}")
-#         if is_dist():
-#             print(f"Validation summary per GPU: {len(val_loader)} batches/epoch, batch size {val_loader.batch_size}")
-#     # Define optimizer groups
-#     # Since we have pretrained vision and language backbones, but a newly initialized modality projection layer, it doesn't make sense to train them with the same learning rate
-#     # You could opt to fully freeze the backbones and only train the MP layer, but finetuning them with a lower learning rate makes the training as a whole easier
-#     param_groups = [{'params': list(model.MP.parameters()), 'lr': train_cfg.lr_mp},
-#                     {'params': list(model.decoder.parameters()) + list(model.vision_encoder.parameters()), 'lr': train_cfg.lr_backbones}]
-#     optimizer = optim.AdamW(param_groups)
-#     all_params = [p for group in optimizer.param_groups for p in group['params']]
-
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#     model.to(device)
-#     if train_cfg.compile:
-#         model = torch.compile(model)
-#     if is_dist():
-#         model = wrap_model(model)
-
-#     epoch_times = []
-#     best_accuracy = 0
-#     global_step = 0
-#     for epoch in range(train_cfg.epochs):
-#         epoch_start_time = time.time()
-#         model.train()
-#         total_train_loss = 0
-#         total_tokens_processed = 0
-#         optimizer.zero_grad()
-
-#         for i, batch in enumerate(train_loader):
-#             batch_start_time = time.time()
-#             images = batch["image"].to(device)
-#             input_ids = batch["input_ids"].to(device)
-#             labels = batch["labels"].to(device)
-#             attention_mask = batch["attention_mask"].to(device)
-
-#             # When using DDP with gradient accumulation,
-#             # skip gradient synchronization on intermediate steps to save time.
-#             # Gradients only need to be synced at the end of each accumulation cycle.
-#             if (is_dist()
-#                 and train_cfg.gradient_accumulation_steps > 1
-#                 and not (
-#                     (i + 1) % train_cfg.gradient_accumulation_steps == 0 
-#                     or i + 1 == len(train_loader)
-#                 )):
-#                 context = model.no_sync()
-#             else:
-#                 context = contextlib.nullcontext()
-
-#             with torch.autocast(device_type='cuda', dtype=torch.bfloat16): # Set to float16 if your hardware doesn't support bfloat16
-#                 with context:
-#                     _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
-
-#             if train_cfg.gradient_accumulation_steps > 1:
-#                 loss = loss / train_cfg.gradient_accumulation_steps
-
-#             loss.backward()
-
-#             if (i + 1) % train_cfg.gradient_accumulation_steps == 0 or i + 1 == len(train_loader):
-#                 if train_cfg.max_grad_norm is not None:
-#                     grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=train_cfg.max_grad_norm)
-
-#                 adj_lr_mp = get_lr(global_step, train_cfg.lr_mp, len(train_loader) * train_cfg.epochs)
-#                 adj_lr_backbones = get_lr(global_step, train_cfg.lr_backbones, len(train_loader) * train_cfg.epochs)
-#                 optimizer.param_groups[0]['lr'] = adj_lr_mp
-#                 optimizer.param_groups[1]['lr'] = adj_lr_backbones
-#                 optimizer.step()
-#                 optimizer.zero_grad()
-
-#             batch_loss = loss.item()
-#             if train_cfg.gradient_accumulation_steps > 1:
-#                 batch_loss = batch_loss * train_cfg.gradient_accumulation_steps
-#             total_train_loss += batch_loss
-
-#             num_tokens = torch.sum(attention_mask).item() # Sum of attention mask gives number of tokens
-#             num_tokens += images.shape[0] * ((images.shape[2] / vlm_cfg.vit_patch_size) ** 2) / (vlm_cfg.mp_pixel_shuffle_factor ** 2) # Add image tokens = batch_size * (((img_size / patch_size) ** 2) / (pixel_shuffle_factor ** 2))
-#             total_tokens_processed += num_tokens
-
-#             batch_end_time = time.time()
-#             batch_duration = batch_end_time - batch_start_time
-#             tokens_per_second = num_tokens / batch_duration 
-
-#             # gather loss and t/s from all ranks if DDP
-#             batch_loss = mean(dist_gather(batch_loss)) if is_dist() else batch_loss  
-#             tokens_per_second = sum(dist_gather(tokens_per_second)) if is_dist() else tokens_per_second  
-
-#             if train_cfg.eval_in_epochs and global_step % train_cfg.eval_interval == 0: #and is_master():
-#                 model.eval()
-#                 torch.cuda.empty_cache()  # Clear GPU memory
-#                 with torch.no_grad():
-#                     total_val_loss = 0
-#                     for batch in val_loader:
-#                         images = batch["image"].to(device)
-#                         input_ids = batch["input_ids"].to(device)
-#                         labels = batch["labels"].to(device)
-#                         attention_mask = batch["attention_mask"].to(device)
-
-#                         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-#                             _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
-
-#                         total_val_loss += loss.item()
-#                     avg_val_loss = total_val_loss / len(val_loader)
-#                     avg_val_loss = mean(dist_gather(avg_val_loss)) if is_dist() else avg_val_loss
-#                     if train_cfg.log_wandb and is_master():
-#                         run.log({"val_loss": avg_val_loss}, step=global_step)
-
-#                     if is_master() and global_step % (train_cfg.eval_interval*2) == 0:
-#                         eval_model = model.module if is_dist() else model  # unwrap the model for eval if DDP
-#                         epoch_accuracy = test_mmstar(eval_model, tokenizer, test_loader, device)
-#                         if epoch_accuracy > best_accuracy:
-#                             best_accuracy = epoch_accuracy
-#                             eval_model.save_pretrained(save_directory=vlm_cfg.vlm_checkpoint_path)
-#                         if train_cfg.log_wandb and is_master():    
-#                             run.log({"accuracy": epoch_accuracy}, step=global_step)
-#                         print(f"Step: {global_step}, Loss: {batch_loss:.4f}, Tokens/s: {tokens_per_second:.2f}, Accuracy: {epoch_accuracy:.4f}")
-#                     elif is_master() and not global_step % (train_cfg.eval_interval*4) == 0:
-#                         print(f"Step: {global_step}, Loss: {batch_loss:.4f}, Tokens/s: {tokens_per_second:.2f}")
-
-#                 model.train()          
-
-#             if train_cfg.log_wandb and is_master():
-#                 run.log({
-#                     "batch_loss": batch_loss,
-#                     "tokens_per_second": tokens_per_second,
-#                     **({"grad_norm": grad_norm} if train_cfg.max_grad_norm is not None else {})
-#                 }, step=global_step)
-                
-#             if (i + 1) % train_cfg.gradient_accumulation_steps == 0 or i + 1 == len(train_loader):
-#                 global_step += 1
-
-#         avg_train_loss = total_train_loss / len(train_loader)
-#         # gather average batch loss from all ranks if DDP
-#         avg_train_loss = mean(dist_gather(avg_train_loss)) if is_dist() else avg_train_loss  
-
-#         epoch_end_time = time.time()
-#         epoch_duration = epoch_end_time - epoch_start_time
-#         epoch_times.append(epoch_duration)
-
-#         # gather and sum total_tokens_processed accross all ranks if DDP
-#         total_tokens_processed = sum(dist_gather(total_tokens_processed)) if is_dist() else total_tokens_processed  
-#         epoch_tokens_per_second = total_tokens_processed / epoch_duration
-
-#         if is_master():
-#             if train_cfg.log_wandb:
-#                 run.log({"epoch_loss": avg_train_loss,
-#                          "epoch_duration": epoch_duration,
-#                          "epoch_tokens_per_second": epoch_tokens_per_second})
-
-#             print(f"Epoch {epoch+1}/{train_cfg.epochs}, Train Loss: {avg_train_loss:.4f} | Time: {epoch_duration:.2f}s | T/s: {epoch_tokens_per_second:.2f}")
-
-#     # Summary Statistics
-#     if is_master():
-#         avg_epoch_time = sum(epoch_times) / len(epoch_times)
-#         total_training_time = sum(epoch_times)
-#         total_samples_processed = len(train_loader.dataset) * train_cfg.epochs
-#         avg_time_per_sample = total_training_time / total_samples_processed
-#         print(f"Average time per epoch: {avg_epoch_time:.2f}s")
-#         print(f"Average time per sample: {avg_time_per_sample:.4f}s")
-
-#         # Push the best model to the hub (Please set your user name in the config!)
-#         if vlm_cfg.hf_repo_name is not None:
-#             print("Training complete. Pushing model to Hugging Face Hub...")
-#             hf_model = CAT.from_pretrained(vlm_cfg.vlm_checkpoint_path)
-#             hf_model.push_to_hub(vlm_cfg.hf_repo_name)
-
-#         if train_cfg.log_wandb:
-#             run.summary["avg_epoch_time"] = avg_epoch_time
-#             run.summary["avg_time_per_sample"] = avg_time_per_sample
-#             run.summary["mmstar_acc"] = best_accuracy
-#             run.finish()
-
-# def main():
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument('--lr_mp', type=float, help='Learning rate for the mapping network')
-#     parser.add_argument('--lr_backbones', type=float, help='Learning rate for the backbones')
-#     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path to the VLM checkpoint for loading or saving')
-#     parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
-#     parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
-
-#     args = parser.parse_args()
-
-#     vlm_cfg = config.VLMConfig()
-#     train_cfg = config.TrainConfig()
-
-#     if args.lr_mp is not None:
-#         train_cfg.lr_mp = args.lr_mp
-#     if args.lr_backbones is not None:
-#         train_cfg.lr_backbones = args.lr_backbones
-#     if args.vlm_checkpoint_path is not None:
-#         vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
-#     if args.compile is not None:
-#         train_cfg.compile = args.compile
-
-#     if args.resume_from_vlm_checkpoint and args.vlm_checkpoint_path is not None:
-#         train_cfg.resume_from_vlm_checkpoint = True
-#         # When resuming a full VLM, we don't need to load individual backbone weights from original sources
-#         vlm_cfg.vlm_load_backbone_weights = False
-
-#     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-#         init_dist()
-
-#     if is_master():
-#         print("--- VLM Config ---")
-#         print(vlm_cfg)
-#         print("--- Train Config ---")
-#         print(train_cfg)
-
-#     train(train_cfg, vlm_cfg)
-
-#     if is_dist():
-#         destroy_dist()
-
-# if __name__ == "__main__":
-#     main()
 import math
 import time
 import torch
@@ -461,6 +15,9 @@ from datasets import load_dataset, concatenate_datasets
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
+from collections import defaultdict
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 torch.manual_seed(0)
 if torch.cuda.is_available():
@@ -476,6 +33,114 @@ import models.utils as utils
 #Otherwise, the tokenizer will through a warning
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+class TimeComplexityTracker:
+    """Comprehensive time complexity and performance tracker"""
+    def __init__(self):
+        self.training_times = []
+        self.testing_times = []
+        self.batch_times = []
+        self.epoch_times = []
+        self.forward_times = []
+        self.backward_times = []
+        self.optimizer_times = []
+        self.data_loading_times = []
+        self.memory_usage = []
+        self.throughput_data = []
+        self.accuracy_history = []
+        self.loss_history = []
+        
+    def start_timer(self, name):
+        setattr(self, f"{name}_start", time.time())
+        
+    def stop_timer(self, name):
+        start_time = getattr(self, f"{name}_start", time.time())
+        duration = time.time() - start_time
+        getattr(self, f"{name}_times", []).append(duration)
+        return duration
+        
+    def log_memory_usage(self):
+        if torch.cuda.is_available():
+            memory_mb = torch.cuda.memory_allocated() / 1024 / 1024
+            self.memory_usage.append(memory_mb)
+            return memory_mb
+        return 0
+        
+    def log_throughput(self, batch_size, tokens_per_second, samples_per_second):
+        self.throughput_data.append({
+            'batch_size': batch_size,
+            'tokens_per_second': tokens_per_second,
+            'samples_per_second': samples_per_second,
+            'timestamp': time.time()
+        })
+        
+    def analyze_complexity(self):
+        """Analyze time complexity patterns"""
+        analysis = {
+            'avg_training_time': np.mean(self.training_times) if self.training_times else 0,
+            'avg_testing_time': np.mean(self.testing_times) if self.testing_times else 0,
+            'avg_batch_time': np.mean(self.batch_times) if self.batch_times else 0,
+            'avg_forward_time': np.mean(self.forward_times) if self.forward_times else 0,
+            'avg_backward_time': np.mean(self.backward_times) if self.backward_times else 0,
+            'avg_optimizer_time': np.mean(self.optimizer_times) if self.optimizer_times else 0,
+            'peak_memory_mb': max(self.memory_usage) if self.memory_usage else 0,
+            'avg_memory_mb': np.mean(self.memory_usage) if self.memory_usage else 0,
+            'total_training_time': sum(self.training_times),
+            'training_efficiency': len(self.batch_times) / sum(self.batch_times) if sum(self.batch_times) > 0 else 0
+        }
+        return analysis
+        
+    def plot_performance_metrics(self, save_path="performance_analysis.png"):
+        """Generate comprehensive performance plots"""
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        
+        # Training time over epochs
+        if self.epoch_times:
+            axes[0,0].plot(self.epoch_times)
+            axes[0,0].set_title('Training Time per Epoch')
+            axes[0,0].set_xlabel('Epoch')
+            axes[0,0].set_ylabel('Time (seconds)')
+            
+        # Memory usage over time
+        if self.memory_usage:
+            axes[0,1].plot(self.memory_usage)
+            axes[0,1].set_title('GPU Memory Usage')
+            axes[0,1].set_xlabel('Step')
+            axes[0,1].set_ylabel('Memory (MB)')
+            
+        # Throughput analysis
+        if self.throughput_data:
+            tokens_per_sec = [d['tokens_per_second'] for d in self.throughput_data]
+            axes[0,2].plot(tokens_per_sec)
+            axes[0,2].set_title('Tokens per Second')
+            axes[0,2].set_xlabel('Step')
+            axes[0,2].set_ylabel('Tokens/sec')
+            
+        # Batch processing time distribution
+        if self.batch_times:
+            axes[1,0].hist(self.batch_times, bins=50, alpha=0.7)
+            axes[1,0].set_title('Batch Processing Time Distribution')
+            axes[1,0].set_xlabel('Time (seconds)')
+            axes[1,0].set_ylabel('Frequency')
+            
+        # Forward vs Backward time comparison
+        if self.forward_times and self.backward_times:
+            min_len = min(len(self.forward_times), len(self.backward_times))
+            axes[1,1].scatter(self.forward_times[:min_len], self.backward_times[:min_len], alpha=0.6)
+            axes[1,1].set_title('Forward vs Backward Time')
+            axes[1,1].set_xlabel('Forward Time (s)')
+            axes[1,1].set_ylabel('Backward Time (s)')
+            
+        # Accuracy over time
+        if self.accuracy_history:
+            axes[1,2].plot(self.accuracy_history)
+            axes[1,2].set_title('Accuracy Over Training')
+            axes[1,2].set_xlabel('Evaluation Step')
+            axes[1,2].set_ylabel('Accuracy')
+            
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Performance analysis saved to {save_path}")
 
 def init_dist():
     dist.init_process_group(backend='nccl')
@@ -510,17 +175,42 @@ def get_run_name(train_cfg):
     epochs = f"ep{train_cfg.epochs}"
     learning_rate = f"lr{train_cfg.lr_backbones}-{train_cfg.lr_mp}"
     num_gpus = f"{get_world_size()}xGPU"
+    optimizer_name = f"opt{train_cfg.optimizer_type}"
+    activation = f"act{train_cfg.activation_function}"
     date = time.strftime("%m%d")
 
-    return f"CAT_{num_gpus}_{dataset_size}_{batch_size}_{epochs}_{learning_rate}_{date}"
+    return f"CAT_{num_gpus}_{dataset_size}_{batch_size}_{epochs}_{learning_rate}_{optimizer_name}_{activation}_{date}"
 
 def get_generator():
     g = torch.Generator()
     g.manual_seed(0)  # Fixed global seed
     return g
 
+def get_optimizer(model, train_cfg):
+    """Enhanced optimizer selection with different optimizers and scheduling"""
+    param_groups = [
+        {'params': list(model.MP.parameters()), 'lr': train_cfg.lr_mp, 'weight_decay': train_cfg.weight_decay_mp},
+        {'params': list(model.decoder.parameters()) + list(model.vision_encoder.parameters()), 
+         'lr': train_cfg.lr_backbones, 'weight_decay': train_cfg.weight_decay_backbone}
+    ]
+    
+    if train_cfg.optimizer_type == 'AdamW':
+        optimizer = optim.AdamW(param_groups, betas=(0.9, 0.999), eps=1e-8)
+    elif train_cfg.optimizer_type == 'Adam':
+        optimizer = optim.Adam(param_groups, betas=(0.9, 0.999), eps=1e-8)
+    elif train_cfg.optimizer_type == 'SGD':
+        optimizer = optim.SGD(param_groups, momentum=0.9, nesterov=True)
+    elif train_cfg.optimizer_type == 'RMSprop':
+        optimizer = optim.RMSprop(param_groups, alpha=0.99, eps=1e-8, momentum=0.9)
+    elif train_cfg.optimizer_type == 'AdaGrad':
+        optimizer = optim.Adagrad(param_groups, eps=1e-10)
+    else:
+        raise ValueError(f"Unsupported optimizer: {train_cfg.optimizer_type}")
+    
+    return optimizer
+
 def save_checkpoint(model, optimizer, epoch, global_step, best_accuracy, train_cfg, vlm_cfg, 
-                   avg_train_loss=None, checkpoint_dir=None):
+                   avg_train_loss=None, checkpoint_dir=None, time_tracker=None):
     """Save comprehensive checkpoint including model, optimizer, and training state"""
     if not is_master():
         return
@@ -553,6 +243,16 @@ def save_checkpoint(model, optimizer, epoch, global_step, best_accuracy, train_c
     
     if torch.cuda.is_available():
         checkpoint_state['cuda_rng_state'] = torch.cuda.get_rng_state_all()
+    
+    # Save time complexity data
+    if time_tracker:
+        checkpoint_state['time_complexity_data'] = {
+            'training_times': time_tracker.training_times,
+            'batch_times': time_tracker.batch_times,
+            'memory_usage': time_tracker.memory_usage,
+            'throughput_data': time_tracker.throughput_data,
+            'accuracy_history': time_tracker.accuracy_history
+        }
     
     # Save checkpoint state
     checkpoint_path = os.path.join(checkpoint_dir, 'training_state.pt')
@@ -616,7 +316,8 @@ def load_checkpoint(checkpoint_dir, model, optimizer, device):
         'epoch': checkpoint_state['epoch'],
         'global_step': checkpoint_state['global_step'],
         'best_accuracy': checkpoint_state['best_accuracy'],
-        'avg_train_loss': checkpoint_state.get('avg_train_loss', None)
+        'avg_train_loss': checkpoint_state.get('avg_train_loss', None),
+        'time_complexity_data': checkpoint_state.get('time_complexity_data', {})
     }
 
 def find_latest_checkpoint(base_dir):
@@ -669,7 +370,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
 
     g = get_generator()
 
-    # Create dataloaders
+    # Create dataloaders with optimized settings
     train_sampler = DistributedSampler(
         train_dataset, 
         rank=get_rank(),
@@ -681,11 +382,13 @@ def get_dataloaders(train_cfg, vlm_cfg):
         batch_size=train_cfg.batch_size,    # =per device BS in DDP
         sampler=train_sampler,
         collate_fn=vqa_collator,
-        num_workers=0,
+        num_workers=train_cfg.num_workers,  # Increased for better data loading
         pin_memory=True,
         drop_last=True,
         worker_init_fn=seed_worker,
         generator=g,
+        persistent_workers=True if train_cfg.num_workers > 0 else False,
+        prefetch_factor=2 if train_cfg.num_workers > 0 else 2,
     )
 
     val_sampler = DistributedSampler(
@@ -700,11 +403,12 @@ def get_dataloaders(train_cfg, vlm_cfg):
         batch_size=train_cfg.batch_size,
         sampler=val_sampler,
         collate_fn=vqa_collator,
-        num_workers=0,
+        num_workers=train_cfg.num_workers,
         pin_memory=True,
         drop_last=True,
         worker_init_fn=seed_worker,
         generator=g,
+        persistent_workers=True if train_cfg.num_workers > 0 else False,
     )
 
     test_loader = DataLoader(
@@ -713,17 +417,25 @@ def get_dataloaders(train_cfg, vlm_cfg):
         shuffle=False, 
         collate_fn=mmstar_collator,
         pin_memory=True,
+        num_workers=train_cfg.num_workers,
         worker_init_fn=seed_worker,
         generator=g,
         )
 
     return train_loader, val_loader, test_loader
 
-def test_mmstar(model, tokenizer, test_loader, device):
+def test_mmstar(model, tokenizer, test_loader, device, time_tracker):
+    """Enhanced testing with time complexity tracking"""
+    time_tracker.start_timer('testing')
+    
     total_examples = 0
     correct_predictions = 0
+    batch_processing_times = []
+    
     with torch.no_grad():
-        for batch in test_loader:
+        for batch_idx, batch in enumerate(test_loader):
+            batch_start_time = time.time()
+            
             image = batch['images'].to(device)
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
@@ -731,7 +443,11 @@ def test_mmstar(model, tokenizer, test_loader, device):
             
             correct_answer = tokenizer.batch_decode(labels, skip_special_tokens=True)
             
+            # Forward pass timing
+            forward_start = time.time()
             gen = model.generate(input_ids, image, attention_mask)
+            forward_time = time.time() - forward_start
+            
             model_output = tokenizer.batch_decode(gen, skip_special_tokens=True)
             
             is_correct = utils.check_multiple_choice_with_regex(model_output, correct_answer)
@@ -739,13 +455,33 @@ def test_mmstar(model, tokenizer, test_loader, device):
             total_examples += len(is_correct)
             if is_correct:
                 correct_predictions += sum(is_correct)
+            
+            batch_time = time.time() - batch_start_time
+            batch_processing_times.append(batch_time)
+            
+            # Log memory usage periodically
+            if batch_idx % 10 == 0:
+                time_tracker.log_memory_usage()
+    
     accuracy = correct_predictions / total_examples if total_examples > 0 else 0
+    
+    testing_time = time_tracker.stop_timer('testing')
+    time_tracker.accuracy_history.append(accuracy)
+    
+    # Calculate testing throughput
+    avg_batch_time = np.mean(batch_processing_times)
+    samples_per_second = test_loader.batch_size / avg_batch_time if avg_batch_time > 0 else 0
+    
+    print(f"Testing completed: {total_examples} samples, {testing_time:.2f}s total, {samples_per_second:.2f} samples/s")
+    
     return accuracy
 
-# Cosine learning rate schedule with warmup (from Karpathy)
-def get_lr(it, max_lr, max_steps):
-    min_lr = max_lr * 0.1
-    warmup_steps = max_steps * 0.03
+# Enhanced cosine learning rate schedule with warmup
+def get_lr(it, max_lr, max_steps, warmup_ratio=0.05, min_lr_ratio=0.1):
+    """Enhanced learning rate scheduler with configurable parameters"""
+    min_lr = max_lr * min_lr_ratio
+    warmup_steps = max_steps * warmup_ratio
+    
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
@@ -758,7 +494,39 @@ def get_lr(it, max_lr, max_steps):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
 
+def calculate_model_complexity(model):
+    """Calculate model complexity metrics"""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    # Calculate FLOPs estimation (simplified)
+    def count_conv_flops(module):
+        if hasattr(module, 'weight') and len(module.weight.shape) == 4:
+            # Conv2d: output_h * output_w * kernel_h * kernel_w * in_channels * out_channels
+            return module.weight.numel() * 2  # Simplified estimation
+        return 0
+    
+    def count_linear_flops(module):
+        if hasattr(module, 'weight') and len(module.weight.shape) == 2:
+            return module.weight.numel() * 2
+        return 0
+    
+    total_flops = 0
+    for module in model.modules():
+        total_flops += count_conv_flops(module)
+        total_flops += count_linear_flops(module)
+    
+    return {
+        'total_params': total_params,
+        'trainable_params': trainable_params,
+        'estimated_flops': total_flops,
+        'model_size_mb': total_params * 4 / (1024 * 1024)  # Assuming float32
+    }
+
 def train(train_cfg, vlm_cfg):
+    # Initialize time complexity tracker
+    time_tracker = TimeComplexityTracker()
+    
     train_loader, val_loader, test_loader = get_dataloaders(train_cfg, vlm_cfg)
     tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer)
 
@@ -770,10 +538,11 @@ def train(train_cfg, vlm_cfg):
     else:
         model = CAT(vlm_cfg, load_backbone=vlm_cfg.vlm_load_backbone_weights)
     
-    # Define optimizer groups
-    param_groups = [{'params': list(model.MP.parameters()), 'lr': train_cfg.lr_mp},
-                    {'params': list(model.decoder.parameters()) + list(model.vision_encoder.parameters()), 'lr': train_cfg.lr_backbones}]
-    optimizer = optim.AdamW(param_groups)
+    # Calculate model complexity
+    model_complexity = calculate_model_complexity(model)
+    
+    # Enhanced optimizer initialization
+    optimizer = get_optimizer(model, train_cfg)
     all_params = [p for group in optimizer.param_groups for p in group['params']]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -794,6 +563,16 @@ def train(train_cfg, vlm_cfg):
                 start_epoch = resume_info['epoch']
                 global_step = resume_info['global_step']
                 best_accuracy = resume_info['best_accuracy']
+                
+                # Restore time complexity data if available
+                if 'time_complexity_data' in resume_info:
+                    time_data = resume_info['time_complexity_data']
+                    time_tracker.training_times = time_data.get('training_times', [])
+                    time_tracker.batch_times = time_data.get('batch_times', [])
+                    time_tracker.memory_usage = time_data.get('memory_usage', [])
+                    time_tracker.throughput_data = time_data.get('throughput_data', [])
+                    time_tracker.accuracy_history = time_data.get('accuracy_history', [])
+                
                 print(f"Resumed training from epoch {start_epoch}, step {global_step}, best accuracy: {best_accuracy:.4f}")
     
     if train_cfg.compile:
@@ -801,7 +580,7 @@ def train(train_cfg, vlm_cfg):
     if is_dist():
         model = wrap_model(model)
 
-    # Initialize wandb
+    # Initialize wandb with enhanced logging
     if train_cfg.log_wandb and is_master():
         run_name = get_run_name(train_cfg)
         if train_cfg.data_cutoff_idx is None:
@@ -816,13 +595,30 @@ def train(train_cfg, vlm_cfg):
             project="CAT",
             config={
                 "VLMConfig": asdict(vlm_cfg),
-                "TrainConfig": asdict(train_cfg)
+                "TrainConfig": asdict(train_cfg),
+                "ModelComplexity": model_complexity
             },
             name=run_name,
             resume="allow" if resume_info else None
         )
 
     if is_master():
+        print(f"=== Model Complexity Analysis ===")
+        print(f"Total parameters: {model_complexity['total_params']:,}")
+        print(f"Trainable parameters: {model_complexity['trainable_params']:,}")
+        print(f"Estimated FLOPs: {model_complexity['estimated_flops']:,}")
+        print(f"Model size: {model_complexity['model_size_mb']:.2f} MB")
+        print(f"Optimizer: {train_cfg.optimizer_type}")
+        print(f"Activation function: {train_cfg.activation_function}")
+        print(f"Input layer size: {vlm_cfg.vit_img_size}x{vlm_cfg.vit_img_size}")
+        print(f"Max sequence length: {vlm_cfg.lm_max_length}")
+        print(f"=== Training Configuration ===")
+        print(f"Batch size (per device): {train_cfg.batch_size}")
+        print(f"Effective batch size: {int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}")
+        print(f"Learning rates: MP={train_cfg.lr_mp}, Backbones={train_cfg.lr_backbones}")
+        print(f"Weight decay: MP={train_cfg.weight_decay_mp}, Backbone={train_cfg.weight_decay_backbone}")
+        print(f"Epochs: {train_cfg.epochs}")
+        print(f"Number of workers: {train_cfg.num_workers}")
         print(f"CAT initialized with {sum(p.numel() for p in model.parameters()):,} parameters") 
         print(f"Training summary{' (global)' if is_dist() else ''}: {len(train_loader.dataset)} samples, {int(len(train_loader)*get_world_size())} batches/epoch, batch size {int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}{', training on ' + str(get_world_size()) + ' GPUs' if is_dist() else ''}")
         if is_dist():
@@ -834,7 +630,255 @@ def train(train_cfg, vlm_cfg):
     epoch_times = []
     
     for epoch in range(start_epoch, train_cfg.epochs):
+        time_tracker.start_timer('training')
         epoch_start_time = time.time()
+
+        image = batch['images'].to(device, non_blocking=True)
+        input_ids = batch['input_ids'].to(device, non_blocking=True)
+        labels = batch['labels'].to(device, non_blocking=True)
+        attention_mask = batch['attention_mask'].to(device, non_blocking=True)
+            
+        # Forward pass with timing
+        time_tracker.start_timer('forward')
+        loss = model(input_ids, image, attention_mask, labels)
+        loss = loss / train_cfg.gradient_accumulation_steps
+        forward_time = time_tracker.stop_timer('forward')
+            
+         # Backward pass with timing
+        time_tracker.start_timer('backward')
+        loss.backward()
+        backward_time = time_tracker.stop_timer('backward')
+            
+        total_train_loss += loss.item() * train_cfg.gradient_accumulation_steps
+            
+        # Count tokens for throughput calculation
+        batch_tokens = (labels != -100).sum().item()
+        total_tokens_processed += batch_tokens
+            
+        # Gradient accumulation and optimization step
+        if (i + 1) % train_cfg.gradient_accumulation_steps == 0:
+            time_tracker.start_timer('optimizer')
+                
+            # Gradient clipping if enabled
+            if train_cfg.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(all_params, train_cfg.grad_clip_norm)
+                
+            # Update learning rates with scheduler
+            current_lr_mp = get_lr(global_step, train_cfg.lr_mp, 
+                                    train_cfg.epochs * len(train_loader) // train_cfg.gradient_accumulation_steps)
+            current_lr_backbone = get_lr(global_step, train_cfg.lr_backbones,
+                                        train_cfg.epochs * len(train_loader) // train_cfg.gradient_accumulation_steps)
+                
+            for param_group in optimizer.param_groups:
+                if param_group == optimizer.param_groups[0]:  # MP parameters
+                    param_group['lr'] = current_lr_mp
+                else:  # Backbone parameters
+                    param_group['lr'] = current_lr_backbone
+                
+            optimizer.step()
+            optimizer.zero_grad()
+            optimizer_time = time_tracker.stop_timer('optimizer')
+                
+            global_step += 1
+                
+            # Log memory usage
+            memory_usage = time_tracker.log_memory_usage()
+                
+            # Calculate throughput
+            batch_time = time.time() - batch_start_time
+            time_tracker.batch_times.append(batch_time)
+            samples_per_second = train_cfg.batch_size * get_world_size() / batch_time
+            tokens_per_second = batch_tokens / forward_time if forward_time > 0 else 0
+            time_tracker.log_throughput(train_cfg.batch_size * get_world_size(), 
+                                          tokens_per_second, samples_per_second)
+                
+            # Detailed logging
+            if global_step % train_cfg.log_every == 0 and is_master():
+                avg_loss = total_train_loss / (i + 1)
+                print(f"Epoch {epoch+1}/{train_cfg.epochs}, Step {global_step}, "
+                          f"Loss: {avg_loss:.6f}, LR_MP: {current_lr_mp:.2e}, "
+                          f"LR_Backbone: {current_lr_backbone:.2e}, "
+                          f"Memory: {memory_usage:.1f}MB, "
+                          f"Samples/s: {samples_per_second:.2f}, "
+                          f"Forward: {forward_time:.3f}s, Backward: {backward_time:.3f}s")
+                    
+                if train_cfg.log_wandb:
+                        wandb.log({
+                            'train/loss': avg_loss,
+                            'train/lr_mp': current_lr_mp,
+                            'train/lr_backbone': current_lr_backbone,
+                            'train/memory_usage_mb': memory_usage,
+                            'train/samples_per_second': samples_per_second,
+                            'train/tokens_per_second': tokens_per_second,
+                            'train/forward_time': forward_time,
+                            'train/backward_time': backward_time,
+                            'train/optimizer_time': optimizer_time,
+                            'train/batch_time': batch_time,
+                            'train/epoch': epoch,
+                            'train/global_step': global_step
+                        })
+        
+        # End of epoch processing
+        avg_train_loss = total_train_loss / len(train_loader)
+        epoch_time = time.time() - epoch_start_time
+        epoch_times.append(epoch_time)
+        time_tracker.epoch_times.append(epoch_time)
+        time_tracker.loss_history.append(avg_train_loss)
+        training_time = time_tracker.stop_timer('training')
+        
+        if is_master():
+            print(f"Epoch {epoch+1} completed in {epoch_time:.2f}s, Avg Loss: {avg_train_loss:.6f}")
+        
+        # Validation phase
+        if (epoch + 1) % train_cfg.val_every == 0:
+            model.eval()
+            val_start_time = time.time()
+            total_val_loss = 0
+            val_samples = 0
+            
+            with torch.no_grad():
+                for val_batch in val_loader:
+                    image = val_batch['images'].to(device, non_blocking=True)
+                    input_ids = val_batch['input_ids'].to(device, non_blocking=True)
+                    labels = val_batch['labels'].to(device, non_blocking=True)
+                    attention_mask = val_batch['attention_mask'].to(device, non_blocking=True)
+                    
+                    val_loss = model(input_ids, image, attention_mask, labels)
+                    total_val_loss += val_loss.item()
+                    val_samples += input_ids.size(0)
+            
+            # Gather validation results from all processes
+            if is_dist():
+                val_loss_tensor = torch.tensor(total_val_loss, device=device)
+                val_samples_tensor = torch.tensor(val_samples, device=device)
+                dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.SUM)
+                dist.all_reduce(val_samples_tensor, op=dist.ReduceOp.SUM)
+                total_val_loss = val_loss_tensor.item()
+                val_samples = val_samples_tensor.item()
+            
+            avg_val_loss = total_val_loss / len(val_loader) if is_dist() else total_val_loss / len(val_loader)
+            val_time = time.time() - val_start_time
+            
+            if is_master():
+                print(f"Validation Loss: {avg_val_loss:.6f}, Time: {val_time:.2f}s")
+                
+                if train_cfg.log_wandb:
+                    wandb.log({
+                        'val/loss': avg_val_loss,
+                        'val/time': val_time,
+                        'train/epoch': epoch
+                    })
+        
+        # Testing phase
+        if (epoch + 1) % train_cfg.test_every == 0:
+            model.eval()
+            test_accuracy = test_mmstar(model, tokenizer, test_loader, device, time_tracker)
+            
+            # Gather test results from all processes
+            if is_dist():
+                accuracy_tensor = torch.tensor(test_accuracy, device=device)
+                dist.all_reduce(accuracy_tensor, op=dist.ReduceOp.SUM)
+                test_accuracy = accuracy_tensor.item() / get_world_size()
+            
+            if is_master():
+                print(f"Test Accuracy: {test_accuracy:.4f}")
+                
+                if train_cfg.log_wandb:
+                    wandb.log({
+                        'test/accuracy': test_accuracy,
+                        'train/epoch': epoch
+                    })
+                
+                # Save checkpoint if this is the best model
+                if test_accuracy > best_accuracy:
+                    best_accuracy = test_accuracy
+                    checkpoint_dir = os.path.join(vlm_cfg.vlm_checkpoint_path, f"best_model_epoch_{epoch+1}")
+                    save_checkpoint(model, optimizer, epoch + 1, global_step, best_accuracy, 
+                                  train_cfg, vlm_cfg, avg_train_loss, checkpoint_dir, time_tracker)
+                    print(f"New best model saved with accuracy: {best_accuracy:.4f}")
+        
+        # Regular checkpoint saving
+        if (epoch + 1) % train_cfg.save_every == 0 and is_master():
+            checkpoint_dir = os.path.join(vlm_cfg.vlm_checkpoint_path, f"epoch_{epoch+1}")
+            save_checkpoint(model, optimizer, epoch + 1, global_step, best_accuracy,
+                          train_cfg, vlm_cfg, avg_train_loss, checkpoint_dir, time_tracker)
+    
+    # Final training completion
+    if is_master():
+        print("Training completed!")
+        
+        # Generate comprehensive performance analysis
+        complexity_analysis = time_tracker.analyze_complexity()
+        print("\n=== Training Performance Analysis ===")
+        print(f"Total training time: {complexity_analysis['total_training_time']:.2f}s")
+        print(f"Average epoch time: {np.mean(epoch_times):.2f}s")
+        print(f"Average batch processing time: {complexity_analysis['avg_batch_time']:.4f}s")
+        print(f"Average forward pass time: {complexity_analysis['avg_forward_time']:.4f}s")
+        print(f"Average backward pass time: {complexity_analysis['avg_backward_time']:.4f}s")
+        print(f"Peak GPU memory usage: {complexity_analysis['peak_memory_mb']:.1f}MB")
+        print(f"Training efficiency: {complexity_analysis['training_efficiency']:.2f} batches/second")
+        print(f"Best test accuracy achieved: {best_accuracy:.4f}")
+        
+        # Generate performance plots
+        time_tracker.plot_performance_metrics("training_performance_analysis.png")
+        
+        # Log final results to wandb
+        if train_cfg.log_wandb:
+            wandb.log({
+                'final/best_accuracy': best_accuracy,
+                'final/total_training_time': complexity_analysis['total_training_time'],
+                'final/avg_epoch_time': np.mean(epoch_times),
+                'final/peak_memory_mb': complexity_analysis['peak_memory_mb'],
+                'final/training_efficiency': complexity_analysis['training_efficiency']
+            })
+            
+            # Upload performance plots
+            wandb.log({"performance_analysis": wandb.Image("training_performance_analysis.png")})
+            wandb.finish()
+        
+        # Save final checkpoint
+        final_checkpoint_dir = os.path.join(vlm_cfg.vlm_checkpoint_path, "final_model")
+        save_checkpoint(model, optimizer, train_cfg.epochs, global_step, best_accuracy,
+                      train_cfg, vlm_cfg, avg_train_loss, final_checkpoint_dir, time_tracker)
+        
+        # Save time complexity analysis
+        with open(os.path.join(vlm_cfg.vlm_checkpoint_path, "training_analysis.json"), 'w') as f:
+            json.dump({
+                'model_complexity': model_complexity,
+                'performance_analysis': complexity_analysis,
+                'training_config': asdict(train_cfg),
+                'vlm_config': asdict(vlm_cfg)
+            }, f, indent=2)
+
+def main():
+    parser = argparse.ArgumentParser(description='Train Vision-Language Model with Time Complexity Analysis')
+    parser.add_argument('--config', type=str, required=True, help='Path to training config file')
+    parser.add_argument('--vlm_config', type=str, required=True, help='Path to VLM config file')
+    parser.add_argument('--distributed', action='store_true', help='Enable distributed training')
+    
+    args = parser.parse_args()
+    
+    # Load configurations
+    with open(args.config, 'r') as f:
+        train_cfg_dict = json.load(f)
+    train_cfg = config.TrainConfig(**train_cfg_dict)
+    
+    with open(args.vlm_config, 'r') as f:
+        vlm_cfg_dict = json.load(f)
+    vlm_cfg = config.VLMConfig(**vlm_cfg_dict)
+    
+    # Initialize distributed training if requested
+    if args.distributed:
+        init_dist()
+    
+    try:
+        train(train_cfg, vlm_cfg)
+    finally:
+        if args.distributed:
+            destroy_dist()
+
+if __name__ == "__main__":
+    main()
         model.train()
         total_train_loss = 0
         total_tokens_processed = 0
@@ -846,232 +890,5 @@ def train(train_cfg, vlm_cfg):
             val_loader.sampler.set_epoch(epoch)
 
         for i, batch in enumerate(train_loader):
+            time_tracker.start_timer('data_loading')
             batch_start_time = time.time()
-            images = batch["image"].to(device)
-            input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-
-            # When using DDP with gradient accumulation,
-            # skip gradient synchronization on intermediate steps to save time.
-            # Gradients only need to be synced at the end of each accumulation cycle.
-            if (is_dist()
-                and train_cfg.gradient_accumulation_steps > 1
-                and not (
-                    (i + 1) % train_cfg.gradient_accumulation_steps == 0 
-                    or i + 1 == len(train_loader)
-                )):
-                context = model.no_sync()
-            else:
-                context = contextlib.nullcontext()
-
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16): # Set to float16 if your hardware doesn't support bfloat16
-                with context:
-                    _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
-
-            if train_cfg.gradient_accumulation_steps > 1:
-                loss = loss / train_cfg.gradient_accumulation_steps
-
-            loss.backward()
-
-            if (i + 1) % train_cfg.gradient_accumulation_steps == 0 or i + 1 == len(train_loader):
-                if train_cfg.max_grad_norm is not None:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=train_cfg.max_grad_norm)
-
-                adj_lr_mp = get_lr(global_step, train_cfg.lr_mp, len(train_loader) * train_cfg.epochs)
-                adj_lr_backbones = get_lr(global_step, train_cfg.lr_backbones, len(train_loader) * train_cfg.epochs)
-                optimizer.param_groups[0]['lr'] = adj_lr_mp
-                optimizer.param_groups[1]['lr'] = adj_lr_backbones
-                optimizer.step()
-                optimizer.zero_grad()
-
-            batch_loss = loss.item()
-            if train_cfg.gradient_accumulation_steps > 1:
-                batch_loss = batch_loss * train_cfg.gradient_accumulation_steps
-            total_train_loss += batch_loss
-
-            num_tokens = torch.sum(attention_mask).item() # Sum of attention mask gives number of tokens
-            num_tokens += images.shape[0] * ((images.shape[2] / vlm_cfg.vit_patch_size) ** 2) / (vlm_cfg.mp_pixel_shuffle_factor ** 2) # Add image tokens = batch_size * (((img_size / patch_size) ** 2) / (pixel_shuffle_factor ** 2))
-            total_tokens_processed += num_tokens
-
-            batch_end_time = time.time()
-            batch_duration = batch_end_time - batch_start_time
-            tokens_per_second = num_tokens / batch_duration 
-
-            # gather loss and t/s from all ranks if DDP
-            batch_loss = mean(dist_gather(batch_loss)) if is_dist() else batch_loss  
-            tokens_per_second = sum(dist_gather(tokens_per_second)) if is_dist() else tokens_per_second  
-
-            if train_cfg.eval_in_epochs and global_step % train_cfg.eval_interval == 0: #and is_master():
-                model.eval()
-                torch.cuda.empty_cache()  # Clear GPU memory
-                with torch.no_grad():
-                    total_val_loss = 0
-                    for batch in val_loader:
-                        images = batch["image"].to(device)
-                        input_ids = batch["input_ids"].to(device)
-                        labels = batch["labels"].to(device)
-                        attention_mask = batch["attention_mask"].to(device)
-
-                        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-                            _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
-
-                        total_val_loss += loss.item()
-                    avg_val_loss = total_val_loss / len(val_loader)
-                    avg_val_loss = mean(dist_gather(avg_val_loss)) if is_dist() else avg_val_loss
-                    if train_cfg.log_wandb and is_master():
-                        run.log({"val_loss": avg_val_loss}, step=global_step)
-
-                    if is_master() and global_step % (train_cfg.eval_interval*2) == 0:
-                        eval_model = model.module if is_dist() else model  # unwrap the model for eval if DDP
-                        epoch_accuracy = test_mmstar(eval_model, tokenizer, test_loader, device)
-                        if epoch_accuracy > best_accuracy:
-                            best_accuracy = epoch_accuracy
-                            # Save best model checkpoint
-                            checkpoint_dir = os.path.join(vlm_cfg.vlm_checkpoint_path, f"best_checkpoint_step_{global_step}")
-                            save_checkpoint(eval_model, optimizer, epoch, global_step, best_accuracy, 
-                                          train_cfg, vlm_cfg, checkpoint_dir=checkpoint_dir)
-                            
-                            # Also save to the main checkpoint path for backward compatibility
-                            eval_model.save_pretrained(save_directory=vlm_cfg.vlm_checkpoint_path)
-                            
-                        if train_cfg.log_wandb and is_master():    
-                            run.log({"accuracy": epoch_accuracy}, step=global_step)
-                        print(f"Step: {global_step}, Loss: {batch_loss:.4f}, Tokens/s: {tokens_per_second:.2f}, Accuracy: {epoch_accuracy:.4f}")
-                    elif is_master() and not global_step % (train_cfg.eval_interval*4) == 0:
-                        print(f"Step: {global_step}, Loss: {batch_loss:.4f}, Tokens/s: {tokens_per_second:.2f}")
-
-                model.train()          
-
-            if train_cfg.log_wandb and is_master():
-                run.log({
-                    "batch_loss": batch_loss,
-                    "tokens_per_second": tokens_per_second,
-                    **({"grad_norm": grad_norm} if train_cfg.max_grad_norm is not None else {})
-                }, step=global_step)
-                
-            if (i + 1) % train_cfg.gradient_accumulation_steps == 0 or i + 1 == len(train_loader):
-                global_step += 1
-
-            # Save checkpoint periodically
-            if (train_cfg.save_checkpoint_steps > 0 and 
-                global_step % train_cfg.save_checkpoint_steps == 0 and
-                is_master()):
-                checkpoint_dir = os.path.join(vlm_cfg.vlm_checkpoint_path, f"checkpoint_step_{global_step}")
-                save_checkpoint(model, optimizer, epoch, global_step, best_accuracy, 
-                              train_cfg, vlm_cfg, total_train_loss / max(1, i + 1), checkpoint_dir)
-
-        avg_train_loss = total_train_loss / len(train_loader)
-        # gather average batch loss from all ranks if DDP
-        avg_train_loss = mean(dist_gather(avg_train_loss)) if is_dist() else avg_train_loss  
-
-        epoch_end_time = time.time()
-        epoch_duration = epoch_end_time - epoch_start_time
-        epoch_times.append(epoch_duration)
-
-        # gather and sum total_tokens_processed accross all ranks if DDP
-        total_tokens_processed = sum(dist_gather(total_tokens_processed)) if is_dist() else total_tokens_processed  
-        epoch_tokens_per_second = total_tokens_processed / epoch_duration
-
-        if is_master():
-            if train_cfg.log_wandb:
-                run.log({"epoch_loss": avg_train_loss,
-                         "epoch_duration": epoch_duration,
-                         "epoch_tokens_per_second": epoch_tokens_per_second,
-                         "epoch": epoch})
-
-            print(f"Epoch {epoch+1}/{train_cfg.epochs}, Train Loss: {avg_train_loss:.4f} | Time: {epoch_duration:.2f}s | T/s: {epoch_tokens_per_second:.2f}")
-
-        # Save checkpoint at the end of each epoch
-        if is_master():
-            checkpoint_dir = os.path.join(vlm_cfg.vlm_checkpoint_path, f"checkpoint_epoch_{epoch+1}")
-            save_checkpoint(model, optimizer, epoch + 1, global_step, best_accuracy, 
-                          train_cfg, vlm_cfg, avg_train_loss, checkpoint_dir)
-
-    # Summary Statistics
-    if is_master():
-        avg_epoch_time = sum(epoch_times) / len(epoch_times)
-        total_training_time = sum(epoch_times)
-        total_samples_processed = len(train_loader.dataset) * train_cfg.epochs
-        avg_time_per_sample = total_training_time / total_samples_processed
-        print(f"Average time per epoch: {avg_epoch_time:.2f}s")
-        print(f"Average time per sample: {avg_time_per_sample:.4f}s")
-
-        # Save final checkpoint
-        final_checkpoint_dir = os.path.join(vlm_cfg.vlm_checkpoint_path, "final_checkpoint")
-        save_checkpoint(model, optimizer, train_cfg.epochs, global_step, best_accuracy, 
-                       train_cfg, vlm_cfg, checkpoint_dir=final_checkpoint_dir)
-
-        # Push the best model to the hub (Please set your user name in the config!)
-        if vlm_cfg.hf_repo_name is not None:
-            print("Training complete. Pushing model to Hugging Face Hub...")
-            try:
-                # Load the best checkpoint for pushing to hub
-                best_checkpoint_dir = os.path.join(vlm_cfg.vlm_checkpoint_path, "best_checkpoint")
-                if os.path.exists(best_checkpoint_dir):
-                    hf_model = CAT.from_pretrained(best_checkpoint_dir)
-                else:
-                    hf_model = CAT.from_pretrained(vlm_cfg.vlm_checkpoint_path)
-                
-                hf_model.push_to_hub(vlm_cfg.hf_repo_name)
-                print(f"Model successfully pushed to {vlm_cfg.hf_repo_name}")
-            except Exception as e:
-                print(f"Error pushing model to HuggingFace Hub: {e}")
-
-        if train_cfg.log_wandb:
-            run.summary["avg_epoch_time"] = avg_epoch_time
-            run.summary["avg_time_per_sample"] = avg_time_per_sample
-            run.summary["mmstar_acc"] = best_accuracy
-            run.summary["final_epoch"] = train_cfg.epochs
-            run.summary["total_steps"] = global_step
-            run.finish()
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--lr_mp', type=float, help='Learning rate for the mapping network')
-    parser.add_argument('--lr_backbones', type=float, help='Learning rate for the backbones')
-    parser.add_argument('--vlm_checkpoint_path', type=str, help='Path to the VLM checkpoint for loading or saving')
-    parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
-    parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
-    parser.add_argument('--auto_resume', type=bool, default=True, help='Automatically resume from the latest checkpoint if available')
-    parser.add_argument('--save_checkpoint_steps', type=int, default=1000, help='Save checkpoint every N steps (0 to disable)')
-
-    args = parser.parse_args()
-
-    vlm_cfg = config.VLMConfig()
-    train_cfg = config.TrainConfig()
-
-    if args.lr_mp is not None:
-        train_cfg.lr_mp = args.lr_mp
-    if args.lr_backbones is not None:
-        train_cfg.lr_backbones = args.lr_backbones
-    if args.vlm_checkpoint_path is not None:
-        vlm_cfg.vlm_checkpoint_path = args.vlm_checkpoint_path
-    if args.compile is not None:
-        train_cfg.compile = args.compile
-    if args.auto_resume is not None:
-        train_cfg.auto_resume = args.auto_resume
-    if args.save_checkpoint_steps is not None:
-        train_cfg.save_checkpoint_steps = args.save_checkpoint_steps
-
-    if args.resume_from_vlm_checkpoint and args.vlm_checkpoint_path is not None:
-        train_cfg.resume_from_vlm_checkpoint = True
-        # When resuming a full VLM, we don't need to load individual backbone weights from original sources
-        vlm_cfg.vlm_load_backbone_weights = False
-
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        init_dist()
-
-    if is_master():
-        print("--- VLM Config ---")
-        print(vlm_cfg)
-        print("--- Train Config ---")
-        print(train_cfg)
-
-    train(train_cfg, vlm_cfg)
-
-    if is_dist():
-        destroy_dist()
-
-if __name__ == "__main__":
-    main() 
