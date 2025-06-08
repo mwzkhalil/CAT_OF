@@ -338,13 +338,68 @@ def get_dataloaders(train_cfg, vlm_cfg):
 
     # Load and combine all training datasets
     combined_train_data = []
-    for dataset_name in train_cfg.train_dataset_name:
-        train_ds = load_dataset(train_cfg.train_dataset_path, dataset_name)
-        combined_train_data.append(train_ds['train'])
-    train_ds = concatenate_datasets(combined_train_data)
     
-    test_ds = load_dataset(train_cfg.test_dataset_path)
-    train_ds = train_ds.shuffle(seed=0) # Shuffle the training dataset, so train and val get equal contributions from all concatinated datasets
+    # Fix: Load the main dataset first, then select specific subsets
+    try:
+        # Load the main cauldron dataset
+        cauldron_dataset = load_dataset(train_cfg.train_dataset_path)
+        
+        # Select and combine specified dataset names
+        for dataset_name in train_cfg.train_dataset_name:
+            if dataset_name in cauldron_dataset:
+                print(f"Loading subset: {dataset_name}")
+                combined_train_data.append(cauldron_dataset[dataset_name])
+            else:
+                print(f"Warning: Dataset '{dataset_name}' not found in {train_cfg.train_dataset_path}")
+                # Try alternative approach - load as separate dataset
+                try:
+                    subset_ds = load_dataset(train_cfg.train_dataset_path, dataset_name, split='train')
+                    combined_train_data.append(subset_ds)
+                    print(f"Successfully loaded {dataset_name} as separate dataset")
+                except Exception as e:
+                    print(f"Failed to load {dataset_name}: {e}")
+                    continue
+    
+    except Exception as e:
+        print(f"Error loading main dataset: {e}")
+        # Fallback: try loading each dataset individually
+        for dataset_name in train_cfg.train_dataset_name:
+            try:
+                # Try different loading approaches
+                subset_ds = load_dataset(train_cfg.train_dataset_path, name=dataset_name, split='train')
+                combined_train_data.append(subset_ds)
+                print(f"Successfully loaded {dataset_name}")
+            except Exception as e2:
+                try:
+                    # Alternative approach
+                    subset_ds = load_dataset(f"{train_cfg.train_dataset_path}/{dataset_name}", split='train')
+                    combined_train_data.append(subset_ds)
+                    print(f"Successfully loaded {dataset_name} with alternative path")
+                except Exception as e3:
+                    print(f"Failed to load {dataset_name}: {e3}")
+                    continue
+    
+    if not combined_train_data:
+        raise ValueError("No training datasets could be loaded successfully")
+    
+    # Combine all successfully loaded datasets
+    if len(combined_train_data) == 1:
+        train_ds = combined_train_data[0]
+    else:
+        train_ds = concatenate_datasets(combined_train_data)
+    
+    print(f"Combined training dataset size: {len(train_ds)}")
+    
+    # Load test dataset
+    try:
+        test_ds = load_dataset(train_cfg.test_dataset_path)
+    except Exception as e:
+        print(f"Error loading test dataset {train_cfg.test_dataset_path}: {e}")
+        # Try alternative loading
+        test_ds = load_dataset(train_cfg.test_dataset_path, split='validation')
+    
+    # Shuffle the training dataset
+    train_ds = train_ds.shuffle(seed=0)
 
     # Apply cutoff if specified
     if train_cfg.data_cutoff_idx is None:
@@ -355,9 +410,25 @@ def get_dataloaders(train_cfg, vlm_cfg):
     val_size = int(total_samples * train_cfg.val_ratio)
     train_size = total_samples - val_size
 
+    # Create dataset splits
     train_dataset = VQADataset(train_ds.select(range(train_size)), tokenizer, image_processor)
     val_dataset = VQADataset(train_ds.select(range(train_size, total_samples)), tokenizer, image_processor)
-    test_dataset = MMStarDataset(test_ds['val'], tokenizer, image_processor)
+    
+    # Handle test dataset structure
+    if isinstance(test_ds, dict):
+        if 'val' in test_ds:
+            test_dataset = MMStarDataset(test_ds['val'], tokenizer, image_processor)
+        elif 'test' in test_ds:
+            test_dataset = MMStarDataset(test_ds['test'], tokenizer, image_processor)
+        elif 'validation' in test_ds:
+            test_dataset = MMStarDataset(test_ds['validation'], tokenizer, image_processor)
+        else:
+            # Take the first available split
+            first_split = list(test_ds.keys())[0]
+            test_dataset = MMStarDataset(test_ds[first_split], tokenizer, image_processor)
+            print(f"Using '{first_split}' split for testing")
+    else:
+        test_dataset = MMStarDataset(test_ds, tokenizer, image_processor)
 
     # Create collators
     vqa_collator = VQACollator(tokenizer, vlm_cfg.lm_max_length)
@@ -375,20 +446,20 @@ def get_dataloaders(train_cfg, vlm_cfg):
         train_dataset, 
         rank=get_rank(),
         num_replicas=get_world_size(),
-    )
+    ) if is_dist() else RandomSampler(train_dataset, generator=g)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=train_cfg.batch_size,    # =per device BS in DDP
         sampler=train_sampler,
         collate_fn=vqa_collator,
-        num_workers=train_cfg.num_workers,  # Increased for better data loading
+        num_workers=getattr(train_cfg, 'num_workers', 4),  # Default to 4 if not specified
         pin_memory=True,
         drop_last=True,
         worker_init_fn=seed_worker,
         generator=g,
-        persistent_workers=True if train_cfg.num_workers > 0 else False,
-        prefetch_factor=2 if train_cfg.num_workers > 0 else 2,
+        persistent_workers=True if getattr(train_cfg, 'num_workers', 4) > 0 else False,
+        prefetch_factor=2 if getattr(train_cfg, 'num_workers', 4) > 0 else 2,
     )
 
     val_sampler = DistributedSampler(
@@ -396,19 +467,20 @@ def get_dataloaders(train_cfg, vlm_cfg):
         rank=get_rank(),
         num_replicas=get_world_size(),
         shuffle=False  # Usually False for validation
-    )
+    ) if is_dist() else None
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=train_cfg.batch_size,
         sampler=val_sampler,
+        shuffle=(val_sampler is None),  # Only shuffle if not using distributed sampler
         collate_fn=vqa_collator,
-        num_workers=train_cfg.num_workers,
+        num_workers=getattr(train_cfg, 'num_workers', 4),
         pin_memory=True,
         drop_last=True,
         worker_init_fn=seed_worker,
         generator=g,
-        persistent_workers=True if train_cfg.num_workers > 0 else False,
+        persistent_workers=True if getattr(train_cfg, 'num_workers', 4) > 0 else False,
     )
 
     test_loader = DataLoader(
@@ -417,10 +489,10 @@ def get_dataloaders(train_cfg, vlm_cfg):
         shuffle=False, 
         collate_fn=mmstar_collator,
         pin_memory=True,
-        num_workers=train_cfg.num_workers,
+        num_workers=getattr(train_cfg, 'num_workers', 4),
         worker_init_fn=seed_worker,
         generator=g,
-        )
+    )
 
     return train_loader, val_loader, test_loader
 
