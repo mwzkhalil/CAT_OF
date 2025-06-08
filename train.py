@@ -921,7 +921,6 @@ def train(train_cfg, vlm_cfg):
                 'training_config': asdict(train_cfg),
                 'vlm_config': asdict(vlm_cfg)
             }, f, indent=2)
-
 def main():
     parser = argparse.ArgumentParser(description='Train Vision-Language Model with Time Complexity Analysis')
     parser.add_argument('--config', type=str, required=True, help='Path to training config file')
@@ -951,16 +950,17 @@ def main():
 
 if __name__ == "__main__":
     main()
-        model.train()
-        total_train_loss = 0
-        total_tokens_processed = 0
-        optimizer.zero_grad()
 
-        # Set epoch for distributed sampler
-        if is_dist():
-            train_loader.sampler.set_epoch(epoch)
-            val_loader.sampler.set_epoch(epoch)
+    model.train()
+    total_train_loss = 0
+    total_tokens_processed = 0
+    optimizer.zero_grad()
 
-        for i, batch in enumerate(train_loader):
-            time_tracker.start_timer('data_loading')
-            batch_start_time = time.time()
+    # Set epoch for distributed sampler
+    if is_dist():
+        train_loader.sampler.set_epoch(epoch)
+        val_loader.sampler.set_epoch(epoch)
+
+    for i, batch in enumerate(train_loader):
+        time_tracker.start_timer('data_loading')
+        batch_start_time = time.time()
